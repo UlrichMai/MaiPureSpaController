@@ -4,96 +4,50 @@
  *
  *  Created on: 2020-05-16
  *      Author: Ulrich Mai
+ *      
+ *  Updated on: 2021-01-23
+ *      Author: James Gibbard
  */
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
-#include <arduino_homekit_server.h>
+#include <ESP8266mDNS.h>
 #include <ESP8266WebServer.h>
 #include <ArduinoOTA.h>
 #include <ArduinoQueue.h>
+#include <PubSubClient.h>
 
-//******************************************************************************************
-//Homekit
+#define MQTT_CLIENT     "Hot_Tub_Controller"                 // mqtt client_id
+#define MQTT_SERVER     "192.168.0.2"                        // mqtt server
+#define MQTT_PORT       1883                                 // mqtt port
+#define MQTT_TOPIC      "home/hot_tub_controller"            // mqtt topic
+#define MQTT_USER       "ha-sonoff"                          // mqtt user
 
-#define SIMPLE_INFO(fmt, ...)   printf_P(PSTR(fmt "\n") , ##__VA_ARGS__);
+#define VERSION    "\n\n-------------- Intex Spa WiFi Controller v1.01pOTA  --------------"
 
-extern "C" homekit_server_config_t config;
-extern "C" homekit_characteristic_t accessory_name;
-extern "C" void accessory_init();
+boolean OTAupdate = false;                                   // (Do not Change)
+boolean requestRestart = false;                              // (Do not Change)
 
-extern "C" void homekit_current_temperature_set(float newValue);
-extern "C" void homekit_target_temperature_set(float newValue);
-extern "C" void homekit_current_heating_cooling_state_set(bool newValue);
-extern "C" void homekit_target_heating_cooling_state_set(bool newValue);
-extern "C" void homekit_power_on_set(bool newValue);
-extern "C" void homekit_pump_on_set(bool newValue);
+int kUpdFreq = 1;                                            // Update frequency in Mintes to check for mqtt connection
+int kRetries = 50;                                           // WiFi retry count. Increase if not connecting to router.
 
-extern "C" void controller_power_state_set(bool newValue);
-extern "C" bool controller_power_state_get();
-extern "C" void controller_power_state_changed_event();
-extern "C" void controller_pump_state_set(bool newValue);
-extern "C" bool controller_pump_state_get();
-extern "C" void controller_pump_state_changed_event();
-extern "C" bool controller_current_heating_state_get();
-extern "C" void controller_current_heating_state_changed_event();
-extern "C" bool controller_target_heating_state_get();
-extern "C" void controller_target_heating_state_set(bool newValue);
-extern "C" void controller_target_heating_state_changed_event();
-extern "C" int controller_current_temperature_get();
-extern "C" void controller_current_temperature_changed_event(int temp);
-extern "C" void controller_target_temperature_set(int newValue);
-extern "C" int controller_target_temperature_get();
-extern "C" void controller_target_temperature_changed_event(int temp);
+unsigned long TTasks;                                        // (Do not Change)
 
-char hostname[] = "Pool_XXXXXX";
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient, MQTT_SERVER, MQTT_PORT);
+
+char hostname[] = "HotTub_XXXXXX";
 
 void generateHostname() {
   uint8_t mac[WL_MAC_ADDR_LENGTH];
   WiFi.macAddress(mac);
-  snprintf(hostname, 11, "Pool_%02X%02X%02X", mac[3], mac[4], mac[5]);
-}
-
-void homekit_setup() {
-  SIMPLE_INFO("");
-  SIMPLE_INFO("SketchSize: %d", ESP.getSketchSize());
-  SIMPLE_INFO("FreeSketchSpace: %d", ESP.getFreeSketchSpace());
-  SIMPLE_INFO("FlashChipSize: %d", ESP.getFlashChipSize());
-  SIMPLE_INFO("FlashChipRealSize: %d", ESP.getFlashChipRealSize());
-  SIMPLE_INFO("FlashChipSpeed: %d", ESP.getFlashChipSpeed());
-  SIMPLE_INFO("SdkVersion: %s", ESP.getSdkVersion());
-  SIMPLE_INFO("FullVersion: %s", ESP.getFullVersion().c_str());
-  SIMPLE_INFO("CpuFreq: %dMHz", ESP.getCpuFreqMHz());
-  SIMPLE_INFO("FreeHeap: %d", ESP.getFreeHeap());
-  SIMPLE_INFO("ResetInfo: %s", ESP.getResetInfo().c_str());
-  SIMPLE_INFO("ResetReason: %s", ESP.getResetReason().c_str());
-  INFO_HEAP();
-
-  accessory_init();
-  accessory_name.value = HOMEKIT_STRING_CPP(hostname);
-
-  arduino_homekit_setup(&config);
-
-  INFO_HEAP();
-}
-
-void homekit_loop() {
-
-  arduino_homekit_loop();
-  static uint32_t next_heap_millis = 0;
-  uint32_t time = millis();
-  if (time > next_heap_millis) {
-    SIMPLE_INFO("heap: %d, sockets: %d",
-        ESP.getFreeHeap(), arduino_homekit_connected_clients_count());
-    next_heap_millis = time + 5000;
-  }
+  snprintf(hostname, 11, "HotTub_%02X%02X%02X", mac[3], mac[4], mac[5]);
 }
 
 /******************************************************************************************/
 // Software SPI Client catching Intex pool controller input
 
-// GPIO Pin
-                        
+// GPIO Pins            
 const int CLK     = D7; 
 const int LAT     = D6; 
 const int DAT_IN  = D5; 
@@ -103,18 +57,30 @@ const int BUZ     = D2; //out=buzzer beep, low=shut off; in=buzzer works normal,
 #define GPIO_IN ((volatile uint32_t*) 0x60000318)     //GPIO Read Register
 #define GPIO_OUT ((volatile uint32_t*) 0x60000300)    //GPIO Write Register
 
-//16-Bit Shift Register, 
+// 16-Bit Shift Register, 
 volatile uint8_t clkCount = 0;
-volatile uint16_t buf = 0;   
+volatile uint16_t buf = 0;
+
+bool flushSync = false;                               // True when display reset, used to sync buffer
 
 char digit[5] = "????";
-int  lstTemp;                 //last valid display reading
-int  curTempTmp;              //current temperature candidate
-bool curTempTmpValid = false; //current temperature candidate is valid / has not timed out
-int  curTemp = 15;            //current temperature
-int  setTemp = 25;            //target temperature
-bool BuzzerEnabled = false;
+int  curTempTmp;                                      // current temperature candidate
+bool curTempTmpValid = false;                         // current temperature candidate is valid / has not timed out
+int  curTemp = 20;                                    // current temperature
+int  setTemp = 38;                                    // target temperature
+int  lstTemp;                                         // last valid display reading
 
+bool BuzzerEnabled = false;                           // (Do not Change) Internal buzzer state
+bool mqttLastBuzzerState = false;                     // (Do not Change) Internal buzzer state
+
+bool powerState = false;                              // (Do not Change) Internal power state
+bool pumpState = false;                               // (Do not Change) Internal pump state
+bool bubbleState = false;                             // (Do not Change) Internal bubble state
+bool heaterState = false;                             // (Do not Change) Internal heater state
+bool heatingState = false;                            // (Do not Change) Internal heating state
+
+int targetTemp = setTemp;                             // (Do not Change) Internal target temp state
+int currentTemp = curTemp;                            // (Do not Change) Internal current temp state
 
 enum ButtonT {
   BTN_POWER  = 0,
@@ -126,52 +92,50 @@ enum ButtonT {
   BTN_FC     = 6
 };
 
-volatile bool    btnRequest[6] = {};
-volatile uint8_t btnCount[6] = {};
+volatile bool    btnRequest[7] = {};
+volatile uint8_t btnCount[7] = {};
 const int btnCycles  = 10;
 bool btnPulse = false;
 
 // Prototypen
 void writeButton(ButtonT button);
 void handleButton(ButtonT button);
+void handleWebButton(ButtonT button);
 
 //Just clock the data bits into the buffer
-void ICACHE_RAM_ATTR SPI_handleClock() {  
+ICACHE_RAM_ATTR void SPI_handleClock() {  
   clkCount++;
-  buf = buf << 1;                                 //Shift buffer along
-  if (bitRead(*GPIO_IN, DAT_IN) == 1) bitSet(buf, 0); //Flip data bit in buffer if needed.
+  buf = buf << 1;                                     // Shift buffer along
+  if (bitRead(*GPIO_IN, DAT_IN) == 1) bitSet(buf, 0); // Flip data bit in buffer if needed.
 }
-/*
-void ICACHE_RAM_ATTR SPI_handleClock() {  
-  if (digitalRead(DAT_IN)==HIGH) {
-    buf = buf << 1;  
-    buf++;
-  } else {
-    buf = buf << 1;  
-  }
-  clkCount++;
-}
-*/
 
-//
-void ICACHE_RAM_ATTR SPI_handleLatch() {
-
+ICACHE_RAM_ATTR void SPI_handleLatch() {
+  if (!simulateButtonPress()) {
+    if (flushSync) {
       if (clkCount == 16) {
-        //Valid if 16 clock cycles detected since last latch
+        // Valid if 16 clock cycles detected since last latch
         if (false);
-        else if (simulateButtonPress());
         else if (bitRead(buf, 6) == 0)  readSegment(0);
         else if (bitRead(buf, 5) == 0)  readSegment(1);
-        else if (bitRead(buf, 11)== 0)  readSegment(2);
+        else if (bitRead(buf, 11) == 0) readSegment(2);
         else if (bitRead(buf, 2) == 0)  readSegment(3);
-        else if (bitRead(buf, 14)== 0)  readLEDStates();
+        else if (bitRead(buf, 14) == 0) readLEDStates();
       }
       // reset buffer
+      flushSync = false;
       buf = 0;
       clkCount = 0;
+     } else {
+      if ((buf | 0xF00) == 0xFFFF) { //If idle, we can use to mark a sync.
+        flushSync = true;
+        buf = 0;
+        clkCount = 0;
+      }
+    }
+  }
 }
 
-void readSegment(int seg) {
+ICACHE_RAM_ATTR void readSegment(int seg) {
   uint16_t d = buf & 13976;      // mask and keep segment bits
   
   if      (d == 16)    digit[seg]='0';
@@ -192,35 +156,43 @@ void readSegment(int seg) {
   else if (d == 13976) digit[seg]=' '; //blank
 
   // if this is the last digit, decide what temp value this is
-  if (seg == 3) classifyTemperatur();
+  if (seg == 3) classifyTemperature();
 }
 
 const int reqCycles = 90;
 int dispCycles = reqCycles; //non blank display cycles
 
-void classifyTemperatur() {
+ICACHE_RAM_ATTR void classifyTemperature() {
   if (digit[0] != ' ') { // non blank display
     // remember the last valid temp reading
     lstTemp = atoi(digit);
+    
     if (--dispCycles < 0) {
       // temperature, that is not followed by an empty display for 90 (>82) cycles, is the current temperature
-      if (curTempTmpValid && curTemp != curTempTmp) {
+      if (validTempValue(curTempTmp) && (curTempTmpValid && curTemp != curTempTmp)) {
         curTemp = curTempTmp;
-        controller_current_temperature_changed_event(curTemp);      
+        Serial.println("Current Temp?: " + String(curTemp));
+        current_temperature_changed_event(curTemp);      
       }
       dispCycles = reqCycles;
       curTempTmp = lstTemp; 
       curTempTmpValid = true;
     }
-  } else { // blank display during blinking
+  } 
+  else { // blank display during blinking
     // temperature before an blank display is the target temperature
-    if (setTemp != lstTemp) {
+    if (validTempValue(lstTemp) && (setTemp != lstTemp)) {
       setTemp = lstTemp;
-      controller_target_temperature_changed_event(setTemp);
+      Serial.println("Target Temp?: " + String(setTemp));
+      target_temperature_changed_event(setTemp);
     }
     dispCycles = reqCycles;
     curTempTmpValid = false;
   }
+}
+
+ICACHE_RAM_ATTR bool validTempValue(int value) {
+  return (value >= 20 && value <= 40);
 }
 
 enum Led {
@@ -232,27 +204,41 @@ enum Led {
 };
 uint8_t ledStates;
 
-void readLEDStates() {
+ICACHE_RAM_ATTR void readLEDStates() {
     uint8_t ls = ledStates;
     ledStates = 0;
 
     if (bitRead(buf, 0 ) == 0) bitSet(ledStates, LED_POWER);
+    if (bitRead(buf, 12) == 0) bitSet(ledStates, LED_FILTER);
     if (bitRead(buf, 10) == 0) bitSet(ledStates, LED_BUBBLE);
     if (bitRead(buf, 9 ) == 0) bitSet(ledStates, LED_HEATER_GREEN);
     if (bitRead(buf, 7 ) == 0) bitSet(ledStates, LED_HEATER_RED);
-    if (bitRead(buf, 12) == 0) bitSet(ledStates, LED_FILTER); 
 
-    if (ls != ledStates) {
-      // changed, use or to what
-      ls = ls ^ ledStates;
-      if (bitRead(ls, LED_POWER) != 0) controller_power_state_changed_event();
-      if (bitRead(ls, LED_FILTER) != 0) controller_pump_state_changed_event();
-      if ((bitRead(ls, LED_HEATER_GREEN) ^ bitRead(ls, LED_HEATER_RED)) != 0) controller_target_heating_state_changed_event();
-      if (bitRead(ls, LED_HEATER_RED) != 0) controller_current_heating_state_changed_event();
-    }
+    if (ls != ledStates) {      
+      if (bitRead(ledStates, LED_POWER) != bitRead(ls, LED_POWER)) {
+          Serial.println("LED_POWER_STATE_CHANGED");
+          controller_power_state_changed_event();
+      }
+      if (bitRead(ledStates, LED_FILTER) != bitRead(ls, LED_FILTER)) {
+        Serial.println("LED_FILTER_STATE_CHANGED");
+        controller_pump_state_changed_event();
+      }
+      if (bitRead(ledStates, LED_BUBBLE) != bitRead(ls, LED_BUBBLE)) {
+        Serial.println("LED_BUBBLE_STATE_CHANGED");
+        controller_bubble_state_changed_event();
+      }
+      if ((bitRead(ledStates, LED_HEATER_GREEN) || bitRead(ledStates, LED_HEATER_RED)) != (bitRead(ls, LED_HEATER_GREEN) ||  bitRead(ls, LED_HEATER_RED))) {
+        Serial.println("LED_HEATER_STATE_CHANGED");
+        controller_heater_state_changed_event();
+      }
+      if (bitRead(ledStates, LED_HEATER_RED) != bitRead(ls, LED_HEATER_RED)) {
+        Serial.println("LED_HEATING_STATE_CHANGED");
+        controller_heating_state_changed_event();
+      }
+   }
 }
 
-bool simulateButtonPress() {
+ICACHE_RAM_ATTR bool simulateButtonPress() {
   // called at each latch
   if (btnPulse) {
     // reset pulse
@@ -280,11 +266,10 @@ bool simulateButtonPress() {
     digitalWrite(DAT_OUT, 0);
     btnPulse = true;
   }
-
   return true;
 }
 
-void writeButton(ButtonT button) {
+ICACHE_RAM_ATTR void writeButton(ButtonT button) {
     btnRequest[button] = true;
     btnCount[button] = btnCycles;
 };
@@ -311,26 +296,35 @@ void buzzSignal(int nBeep) {
   switchBuzz(BuzzerEnabled);
 };
 
+void initial_publish() {
+  mqttLog("Publishing initial values . . .");
+  mqttPublish("power_state", (powerState ? "on":"off"));
+  mqttPublish("buzzer_state", (BuzzerEnabled ? "on":"off"));
+  mqttPublish("pump_state", (powerState ? "on":"off"));
+  mqttPublish("bubble_state", (bubbleState ? "on":"off"));
+  mqttPublish("heater_state", (heaterState ? "on":"off"));
+  mqttPublish("heating_state", (heatingState ? "on":"off"));
+}
+
 void SPI_begin() {
-  //Configure shift register
+  mqttLog("SPI: Configuring shift register . . .");
   pinMode(CLK, INPUT);
   pinMode(LAT, INPUT);
   pinMode(DAT_IN, INPUT);
   pinMode(DAT_OUT, OUTPUT);
   digitalWrite(DAT_OUT, 1); //default high
   switchBuzz(BuzzerEnabled);
-  
+
+  mqttLog("SPI: Attaching handlers to interrupts . . .");
   attachInterrupt(digitalPinToInterrupt(CLK), SPI_handleClock, RISING);
   attachInterrupt(digitalPinToInterrupt(LAT), SPI_handleLatch, RISING);
 }
 
 void SPI_end() {
+  mqttLog("SPI: Detaching handlers from interrupts . . .");
   detachInterrupt(digitalPinToInterrupt(CLK));
   detachInterrupt(digitalPinToInterrupt(LAT));
 }
-
-
-
 
 //---------------------------------------------------------------
 // highlevel pool controller methods
@@ -338,121 +332,27 @@ void SPI_end() {
 typedef enum {
     EVT_POWER_STATE_CHANGED,
     EVT_PUMP_STATE_CHANGED,
+    EVT_BUBBLE_STATE_CHANGED,
+    EVT_HEATER_STATE_CHANGED,
+    EVT_HEATING_STATE_CHANGED,
     EVT_CURRENT_TEMPERATURE_CHANGED,
-    EVT_TARGET_TEMPERATURE_CHANGED,
-    EVT_TARGET_HEATING_STATE_CHANGED,
-    EVT_CURRENT_HEATING_STATE_CHANGED
+    EVT_TARGET_TEMPERATURE_CHANGED
 } EventType;
   
 typedef struct {
-  EventType evt ;
+  EventType evt;
   bool state; 
   int temp;
 } EventT;
 
-ArduinoQueue<EventT> EventQueue(100);
-void PrintEvent( EventT e );
+ArduinoQueue<EventT> EventQueue(200);
 
-void PrintEvent( EventT e ) {
-    switch (e.evt) {
-      case EVT_POWER_STATE_CHANGED:
-        Serial.printf("EVT_POWER_STATE_CHANGED %d\n", e.state);
-        break;
-      case EVT_PUMP_STATE_CHANGED: 
-        Serial.printf("EVT_PUMP_STATE_CHANGED %d\n", e.state);
-        break;
-      case EVT_CURRENT_TEMPERATURE_CHANGED: 
-        Serial.printf("EVT_CURRENT_TEMPERATURE_CHANGED %d\n", e.temp);
-        break;
-      case EVT_TARGET_TEMPERATURE_CHANGED:
-        Serial.printf("EVT_TARGET_TEMPERATURE_CHANGED %d\n", e.temp);
-        break;
-      case EVT_TARGET_HEATING_STATE_CHANGED: 
-        Serial.printf("EVT_TARGET_HEATING_STATE_CHANGED %d\n", e.state);
-        break;
-      case EVT_CURRENT_HEATING_STATE_CHANGED:
-        Serial.printf("EVT_CURRENT_HEATING_STATE_CHANGED %d\n", e.state);
-        break;
-    }  
-}
+//***********************************
+// Temperature Events 
+//***********************************
 
-// controller: power_state_set, power_state_get, power_state_changed_event
-void controller_power_state_set(bool newValue) {
-  int retry = 1;
-  while (controller_power_state_get() != newValue) {
-    writeButton(BTN_POWER);
-    delay(500);
-    if (--retry < 0) return;
-  }
-}
-bool controller_power_state_get() {
-  return (bitRead(ledStates, LED_POWER) == 1);
-}
-void controller_power_state_changed_event() {
-  EventT e;
-  e.evt = EVT_POWER_STATE_CHANGED;
-  e.state = controller_power_state_get();
-  e.temp = 0.0;
-  EventQueue.enqueue(e);
-}
-
-// controller: pump_state_set, pump_state_get, pump_state_changed_event
-void controller_pump_state_set(bool newValue) {
-  int retry = 1;
-  while (controller_pump_state_get() != newValue) {
-    writeButton(BTN_FILTER);
-    delay(500);
-    if (--retry < 0) return;
-  }
-}
-bool controller_pump_state_get() {
-  return (bitRead(ledStates, LED_FILTER) == 1);
-}
-void controller_pump_state_changed_event() {
-  EventT e;
-  e.evt = EVT_PUMP_STATE_CHANGED;
-  e.state = controller_pump_state_get();
-  e.temp = 0.0;
-  EventQueue.enqueue(e);
-}
-
-// controller: current_heating_state_get, current_heating_state_changed_event
-bool controller_current_heating_state_get() {
-  return (bitRead(ledStates, LED_HEATER_RED) == 1);
-}
-void controller_current_heating_state_changed_event() {
-  EventT e;
-  e.evt = EVT_CURRENT_HEATING_STATE_CHANGED;
-  e.state = controller_current_heating_state_get();
-  e.temp = 0.0;
-  EventQueue.enqueue(e);
-}
-
-// controller: target_heating_state_set, target_heating_state_get, target_heating_state_changed_event
-bool controller_target_heating_state_get() {
-  return (bitRead(ledStates, LED_HEATER_GREEN) == 1 || bitRead(ledStates, LED_HEATER_RED) == 1);
-}
-void controller_target_heating_state_set(bool newValue) {
-  int retry = 1;
-  while (controller_target_heating_state_get() != newValue) {
-    writeButton(BTN_HEATER);
-    delay(500);
-    if (--retry < 0) return;
-  }
-}
-void controller_target_heating_state_changed_event() {
-  EventT e;
-  e.evt = EVT_TARGET_HEATING_STATE_CHANGED;
-  e.state = controller_target_heating_state_get();
-  e.temp = 0.0;
-  EventQueue.enqueue(e);
-}
-
-// controller: current_temperature_get, current_temperature_changed_event
-int controller_current_temperature_get() {
-  return curTemp;
-}
-void controller_current_temperature_changed_event(int temp) {
+// CURRENT TEMP value changed event
+ICACHE_RAM_ATTR void current_temperature_changed_event(int temp) {
   EventT e;
   e.evt = EVT_CURRENT_TEMPERATURE_CHANGED;
   e.state = false;
@@ -460,8 +360,150 @@ void controller_current_temperature_changed_event(int temp) {
   EventQueue.enqueue(e);
 }
 
-// controller: target_temperature_get,set,changed_event
-void controller_target_temperature_set(int newValue) {
+// TARGET TEMP value changed event
+ICACHE_RAM_ATTR void target_temperature_changed_event(int temp) {
+  // called inside ISR, be fast!
+  EventT e;
+  e.evt = EVT_TARGET_TEMPERATURE_CHANGED;
+  e.state = false;
+  e.temp = temp;
+  EventQueue.enqueue(e);
+}
+
+//***********************************
+// Controller Events
+//***********************************
+
+// POWER state changed event
+ICACHE_RAM_ATTR void controller_power_state_changed_event() {
+  EventT e;
+  e.evt = EVT_POWER_STATE_CHANGED;
+  e.state = controller_power_state_get();
+  e.temp = 0.0;
+  EventQueue.enqueue(e);
+}
+
+// PUMP state changed event
+ICACHE_RAM_ATTR void controller_pump_state_changed_event() {
+  EventT e;
+  e.evt = EVT_PUMP_STATE_CHANGED;
+  e.state = controller_pump_state_get();
+  e.temp = 0.0;
+  EventQueue.enqueue(e);
+}
+
+// BUBBLE state changed event
+ICACHE_RAM_ATTR void controller_bubble_state_changed_event() {
+  EventT e;
+  e.evt = EVT_BUBBLE_STATE_CHANGED;
+  e.state = controller_bubble_state_get();
+  e.temp = 0.0;
+  EventQueue.enqueue(e);
+}
+
+// HEATER state changed event
+ICACHE_RAM_ATTR void controller_heater_state_changed_event() {
+  EventT e;
+  e.evt = EVT_HEATER_STATE_CHANGED;
+  e.state = controller_heater_state_get();
+  e.temp = 0.0;
+  EventQueue.enqueue(e);
+}
+
+// HEATING state changed event
+ICACHE_RAM_ATTR void controller_heating_state_changed_event() {
+  EventT e;
+  e.evt = EVT_HEATING_STATE_CHANGED;
+  e.state = controller_heating_state_get();
+  e.temp = 0.0;
+  EventQueue.enqueue(e);
+}
+
+//***********************************
+// Controller Getters
+//***********************************
+
+// POWER get state
+ICACHE_RAM_ATTR bool controller_power_state_get() {
+  return (bitRead(ledStates, LED_POWER) == 1);
+}
+
+// PUMP get state
+ICACHE_RAM_ATTR bool controller_pump_state_get() {
+  return (bitRead(ledStates, LED_FILTER) == 1);
+}
+
+// BUBBLE get state
+ICACHE_RAM_ATTR bool controller_bubble_state_get() {
+  return (bitRead(ledStates, LED_BUBBLE) == 1);
+}
+
+// HEATER get state
+ICACHE_RAM_ATTR bool controller_heater_state_get() {
+  return (bitRead(ledStates, LED_HEATER_GREEN) == 1 || bitRead(ledStates, LED_HEATER_RED) == 1);
+}
+
+// HEATING get state
+ICACHE_RAM_ATTR bool controller_heating_state_get() {
+  return (bitRead(ledStates, LED_HEATER_RED) == 1);
+}
+
+// CURRENT TEMP get value
+ICACHE_RAM_ATTR int controller_current_temperature_get() {
+  return curTemp;
+}
+
+// TARGET TEMP get value
+ICACHE_RAM_ATTR int controller_target_temperature_get() {
+  return setTemp;
+}
+
+//***********************************
+// Controller Setters
+//***********************************
+
+// POWER set state
+ICACHE_RAM_ATTR void controller_power_state_set(bool newValue) {
+  int retry = 1;
+  while (controller_power_state_get() != newValue) {
+    writeButton(BTN_POWER);
+    delay(500);
+    if (--retry < 0) return;
+  }
+}
+
+// PUMP set state
+ICACHE_RAM_ATTR void controller_pump_state_set(bool newValue) {
+  int retry = 1;
+  while (controller_pump_state_get() != newValue) {
+    writeButton(BTN_FILTER);
+    delay(500);
+    if (--retry < 0) return;
+  }
+}
+
+// BUBBLE set state
+ICACHE_RAM_ATTR void controller_bubble_state_set(bool newValue) {
+  int retry = 1;
+  while (controller_bubble_state_get() != newValue) {
+    writeButton(BTN_BUBBLE);
+    delay(500);
+    if (--retry < 0) return;
+  }
+}
+
+// HEATER set state
+ICACHE_RAM_ATTR void controller_heater_state_set(bool newValue) {
+  int retry = 1;
+  while (controller_heater_state_get() != newValue) {
+    writeButton(BTN_HEATER);
+    delay(500);
+    if (--retry < 0) return;
+  }
+}
+
+// TARGET TEMP set value
+ICACHE_RAM_ATTR void controller_target_temperature_set(int newValue) {
   int retry = 20;
   // only works if power is on
   if (controller_power_state_get()) {
@@ -471,50 +513,139 @@ void controller_target_temperature_set(int newValue) {
       } else {
         writeButton(BTN_UP);
       }
+      delay(500);
+      if (--retry < 0) return;
+    }
+  }
+}
+
+// TARGET TEMP increase value
+ICACHE_RAM_ATTR void controller_target_temperature_increase() {
+  int retry = 1;
+  int tempNow = controller_target_temperature_get();
+  // only works if power is on
+  if (controller_power_state_get()) {
+    while (controller_target_temperature_get() != (tempNow + 1)) {
+      writeButton(BTN_UP);
       delay(600);
       if (--retry < 0) return;
     }
   }
 }
-int controller_target_temperature_get() {
-  return setTemp;
+
+// TARGET TEMP decrease value
+ICACHE_RAM_ATTR void controller_target_temperature_decrease() {
+  int retry = 1;
+  int tempNow = controller_target_temperature_get();
+  // only works if power is on
+  if (controller_power_state_get()) {
+    while (controller_target_temperature_get() != (tempNow - 1)) {
+      writeButton(BTN_DOWN);
+      delay(600);
+      if (--retry < 0) return;
+    }
+  }
 }
-void controller_target_temperature_changed_event(int temp) {
-  // called inside ISR, be fast!
-  EventT e;
-  e.evt = EVT_TARGET_TEMPERATURE_CHANGED;
-  e.state = false;
-  e.temp = temp;
-  EventQueue.enqueue(e);
+
+//***********************************
+// Controller Button Handler
+//***********************************
+
+void handleBuzz(bool bOn) {
+  switchBuzz( bOn );
+  buzzSignal( (bOn ? 2 : 1) );
 }
+
+void handleButton(ButtonT button) {
+   switch (button) {
+      case BTN_POWER:
+        controller_power_state_set(!controller_power_state_get());
+        break;
+      case BTN_FILTER:
+        controller_pump_state_set(!controller_pump_state_get());
+        break;
+      case BTN_HEATER:
+        controller_heater_state_set(!controller_heater_state_get());
+        break;
+      case BTN_BUBBLE:
+        controller_bubble_state_set(!controller_bubble_state_get());
+        break;
+      case BTN_UP:
+        controller_target_temperature_increase();
+        break;
+      case BTN_DOWN:
+        controller_target_temperature_decrease();
+        break;
+   }
+}
+
+//***********************************
+// Controller Event Loop - process
+//***********************************
 
 void controller_loop() {
   //handle events from controller like user interaction, current temp changes, heater changes
 
+   if (mqttLastBuzzerState != BuzzerEnabled) {
+     mqttLog("EVT_BUZZER_STATE_CHANGED: " + String(mqttLastBuzzerState ? "on":"off") + " -> " + String(BuzzerEnabled ? "on":"off"));
+     mqttPublish("buzzer_state", String(BuzzerEnabled ? "on":"off"));
+     mqttLastBuzzerState = BuzzerEnabled;
+   }
+
   if (!EventQueue.isEmpty()) {
     EventT e = EventQueue.dequeue();
-    PrintEvent(e);
     switch (e.evt) {
       case EVT_POWER_STATE_CHANGED:
-        homekit_power_on_set(e.state);
+        if (powerState != e.state) {
+          mqttLog("EVT_POWER_STATE_CHANGED: " + String(powerState ? "on":"off") + " -> " + String(e.state ? "on":"off"));
+          powerState = e.state;
+          mqttPublish("power_state", String(powerState ? "on":"off"));
+        }
         break;
-      case EVT_PUMP_STATE_CHANGED: 
-        homekit_pump_on_set(e.state);
-        break;
-      case EVT_CURRENT_TEMPERATURE_CHANGED: 
-        homekit_current_temperature_set(float(e.temp));
-        break;
-      case EVT_TARGET_TEMPERATURE_CHANGED:
-        homekit_target_temperature_set(float(e.temp));
-        break;
-      case EVT_TARGET_HEATING_STATE_CHANGED: 
-        homekit_target_heating_cooling_state_set(e.state);
-        break;
-      case EVT_CURRENT_HEATING_STATE_CHANGED:
-        homekit_current_heating_cooling_state_set(e.state);
-        break;
-    }
-  }
+       case EVT_PUMP_STATE_CHANGED:
+         if (pumpState != e.state) {
+          mqttLog("EVT_PUMP_STATE_CHANGED: " + String(pumpState ? "on":"off") + " -> " + String(e.state ? "on":"off"));
+          pumpState = e.state;
+          mqttPublish("pump_state", String(pumpState ? "on":"off"));
+         }
+         break;
+       case EVT_BUBBLE_STATE_CHANGED:
+         if (bubbleState != e.state) {
+          mqttLog("EVT_BUBBLE_STATE_CHANGED: " + String(bubbleState ? "on":"off") + " -> " + String(e.state ? "on":"off"));
+          bubbleState = e.state;
+          mqttPublish("bubble_state", String(bubbleState ? "on":"off"));
+         }
+         break;
+       case EVT_HEATER_STATE_CHANGED:
+         if (heaterState != e.state) {
+           mqttLog("EVT_HEATER_STATE_CHANGED: " + String(heaterState ? "on":"off") + " -> " + String(e.state ? "on":"off"));
+           heaterState = e.state;
+           mqttPublish("heater_state", String(heaterState ? "on":"off"));
+         }
+         break;
+       case EVT_HEATING_STATE_CHANGED:
+         if (heatingState != e.state) {
+            mqttLog("EVT_HEATING_STATE_CHANGED: " + String(heatingState ? "on":"off") + " -> " + String(e.state ? "on":"off"));
+             heatingState = e.state;
+             mqttPublish("heating_state", String(heatingState ? "on":"off"));
+         }
+         break;
+       case EVT_CURRENT_TEMPERATURE_CHANGED: 
+         if (currentTemp != e.temp && validTempValue(e.temp)) {
+           mqttLog("EVT_CURRENT_TEMPERATURE_CHANGED: " + String(currentTemp) + " -> " +  String(e.temp));
+           currentTemp = int(e.temp);
+           mqttPublish("current_temperature", String(currentTemp));
+         }
+         break;
+       case EVT_TARGET_TEMPERATURE_CHANGED:
+         if (targetTemp != e.temp && validTempValue(e.temp)) {
+           mqttLog("EVT_TARGET_TEMPERATURE_CHANGED: " + String(targetTemp) + " -> " +  String(e.temp));
+           targetTemp = int(e.temp);
+           mqttPublish("target_temperature", String(targetTemp));
+         }
+         break;
+      }
+   }
 }
 
 // Private.h contains the ssid and password as a temporary measure until a config page is added
@@ -553,43 +684,42 @@ const char htmlTemplate[] =
 "<html lang='en'>"
 "<head>"
 " <title>%s</title>"
-" <metax http-equiv='refresh' content='5' >"
-" <meta charset='utf-8'>"
+" <metax http-equiv='refresh' content='5' />"
+" <meta charset='utf-8' />"
 " <meta name='viewport' content='width=device-width,initial-scale=1'/>"
+" <link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta1/dist/css/bootstrap.min.css\" rel=\"stylesheet\" integrity=\"sha384-giJF6kkoqNQ00vy+HMDP7azOuL0xtbfIcaT9wjKHr8RbDVddVHyTfAAsrekwKmP1\" crossorigin=\"anonymous\" />"
 "</head>"
 "<body>"
-" <h1>Whirlpool Controller</h1>"
-"Water temperature:  %d<br>"
-"Target temperature: %d"
-"&nbsp;&nbsp;"
-"<a href='/up'>&nbsp;&uArr;&nbsp;</a>"
-"&nbsp;"
-"<a href='/down'>&nbsp;&dArr;&nbsp;</a>"
-"<br>"
-"<br>"
-"<a href='/power'>Power</a>: %s <br> "
-"<a href='/filter'>Filter</a>: %s <br> "
-"<a href='/heater'>Heater</a>: %s <br> "
-"<a href='/bubble'>Bubble</a>: %s <br> "
-"<br>"
-"<a href='/buzz%s'>Buzzer</a>: %s <br> "
-"<a href='/homekit-reset'>HomeKit Reset</a><br> "
-"<br>"
-"<a href='/'>refresh</a><br> "
+" <h1>Intex Hot Tub Controller</h1>"
+"<ul class=\"list-group\">"
+"  <li class=\"list-group-item\">Water temperature:  <span class=\"badge bg-secondary\">%d</span></li>"
+"  <li class=\"list-group-item\">Target temperature: <span class=\"badge bg-secondary\">%d</span></li>"
+"  <li class=\"list-group-item\">"
+"     <a class=\"btn btn-primary\" role=\"button\" href='/up'>INCREASE</a>"
+"     <a class=\"btn btn-primary\" role=\"button\" href='/down'>DECREASE</a>"
+"  </li>"
+"  <li class=\"list-group-item\">Power <a class=\"btn btn-primary\" role=\"button\" href='/power'> %s </a></li>"
+"  <li class=\"list-group-item\">Filter <a class=\"btn btn-primary\" role=\"button\" href='/filter'> %s </a></li>"
+"  <li class=\"list-group-item\">Heater <a class=\"btn btn-primary\" role=\"button\" href='/heater'> %s </a></li>"
+"  <li class=\"list-group-item\">Bubble <a class=\"btn btn-primary\" role=\"button\" href='/bubble'> %s </a></li>"
+"  <li class=\"list-group-item\">Buzzer <a class=\"btn btn-primary\" role=\"button\" href='/buzz%s'> %s </a></li>"
+"  <li class=\"list-group-item\"><a class=\"btn btn-primary\" role=\"button\" href='/'>Refresh</a></li>"
+"</ul>"
+
 "</body>"
 "</html>";
 
-char message[1000];
+char message[3000];
 void handleStatus() {
   
-  snprintf(message, 1000, htmlTemplate, 
+  snprintf(message, 3000, htmlTemplate, 
     hostname,
     curTemp, 
     setTemp, 
-    (bitRead(ledStates, LED_POWER) == 1)?"ON" : "OFF",
-    (bitRead(ledStates, LED_FILTER) == 1)?"ON" : "OFF",
-    (bitRead(ledStates, LED_HEATER_GREEN) == 1)?"GREEN" : (bitRead(ledStates, LED_HEATER_RED) == 1)?"RED" : "OFF",
-    (bitRead(ledStates, LED_BUBBLE) == 1)?"ON" : "OFF",
+    controller_power_state_get() ? "ON" : "OFF",
+    controller_pump_state_get() ? "ON" : "OFF",
+    controller_heater_state_get() ? "ON" : "OFF",
+    controller_bubble_state_get() ? "ON" : "OFF",
     (BuzzerEnabled?"0":"1"), (BuzzerEnabled?"ON":"OFF")
   );
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
@@ -599,28 +729,14 @@ void handleStatus() {
   Serial.printf("strlen(message): %d\n",strlen(message));
 };
 
-void handleButton(ButtonT button) {
-  writeButton(button);
+void handleWebButton(ButtonT button) {
+  handleButton(button);
   returnToStatus();
 };
 
-void handleBuzz(bool bOn) {
-  switchBuzz( bOn );
-  buzzSignal( (bOn ? 2 : 1) );
+void handleWebBuzz(bool bOn) {
+  handleBuzz(bOn);
   returnToStatus();
-};
-
-void handleSet() {
-  if (server.args()>=1) {
-    if (server.argName(0).equals("power")) 
-      controller_power_state_set(server.arg(0).equals("on"));
-      
-    else if (server.argName(0).equals("temp")) 
-      controller_target_temperature_set(server.arg(0).toInt());
-
-  }
-  server.send(200, "text/plain", "ok");
-  //returnToStatus();
 };
 
 void server_setup() {
@@ -632,31 +748,17 @@ void server_setup() {
     ESP.reset();
   });
 
-  server.on("/homekit-reset", []() {
-    server.send(200, "text/plain", "HomeKit reset paring...");
-    SPI_end(); // disable interrupts
-    homekit_storage_reset();
-    delay(1);
-    ESP.restart();
-  });
-
-  server.on("/power",  []() {handleButton(BTN_POWER);});
-  server.on("/up",     []() {handleButton(BTN_UP);});
-  server.on("/down",   []() {handleButton(BTN_DOWN);});
-  server.on("/filter", []() {handleButton(BTN_FILTER);});
-  server.on("/heater", []() {handleButton(BTN_HEATER);});
-  server.on("/bubble",[]() {handleButton(BTN_BUBBLE);});
-  server.on("/fc",     []() {handleButton(BTN_FC);});
-  server.on("/buzz0",     []() {handleBuzz(0);});
-  server.on("/buzz1",     []() {handleBuzz(1);});
+  server.on("/power",  []() {handleWebButton(BTN_POWER);});
+  server.on("/up",     []() {handleWebButton(BTN_UP);});
+  server.on("/down",   []() {handleWebButton(BTN_DOWN);});
+  server.on("/filter", []() {handleWebButton(BTN_FILTER);});
+  server.on("/heater", []() {handleWebButton(BTN_HEATER);});
+  server.on("/bubble", []() {handleWebButton(BTN_BUBBLE);});
+  server.on("/buzz0",  []() {handleWebBuzz(0);});
+  server.on("/buzz1",  []() {handleWebBuzz(1);});
   server.onNotFound(handleNotFound);
 
-  server.on("/power1",  []() {controller_power_state_set(true);returnToStatus();});
-  server.on("/power0",  []() {controller_power_state_set(false);returnToStatus();});
-  server.on("/set",  []() {handleSet();});
-
   server.begin();
-
 }
 //******************************************************************************************
 
@@ -666,25 +768,66 @@ void ota_setup() {
   ArduinoOTA.setPassword(passwordOTA);
 
   ArduinoOTA.onStart([]() {
+    OTAupdate = true;
     SPI_end(); // disable interrupts, otherwise OTA is failing
-    Serial.println("Start");
+    mqttLog("OTA Update Initiated . . .");
   });
+  
   ArduinoOTA.onEnd([]() {
-    Serial.println("\nEnd");
+    mqttLog("\nOTA Update Ended . . .");
+    ESP.restart();
   });
+  
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
     Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
   });
+  
   ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("Error[%u]: ", error);
-    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-    else if (error == OTA_END_ERROR) Serial.println("End Failed");
-  });
-  ArduinoOTA.begin();
+    OTAupdate = false;
+    Serial.printf("OTA Error [%u] ", error);
+    String otaErr = "";
+    if (error == OTA_AUTH_ERROR) otaErr = ". . . . . . . . . . . . . . . Auth Failed";
+    else if (error == OTA_BEGIN_ERROR) otaErr = ". . . . . . . . . . . . . . . Begin Failed";
+    else if (error == OTA_CONNECT_ERROR) otaErr = ". . . . . . . . . . . . . . . Connect Failed";
+    else if (error == OTA_RECEIVE_ERROR) otaErr = ". . . . . . . . . . . . . . . Receive Failed";
+    else if (error == OTA_END_ERROR) otaErr = ". . . . . . . . . . . . . . . End Failed";
 
+    mqttLog(otaErr);
+  });
+  
+  ArduinoOTA.begin();
+}
+
+//******************************************************************************************
+
+void callback(const MQTT::Publish& pub) {
+  if (pub.topic() == MQTT_TOPIC"/power") {
+    if (pub.payload_string() == "on") controller_power_state_set(true);
+    else if (pub.payload_string() == "off") controller_power_state_set(false);
+  }
+  else if (pub.topic() == MQTT_TOPIC"/pump") {
+    if (pub.payload_string() == "on") controller_pump_state_set(true);
+    else if (pub.payload_string() == "off") controller_pump_state_set(false);
+  }
+  else if (pub.topic() == MQTT_TOPIC"/heater") {
+    if (pub.payload_string() == "on") controller_heater_state_set(true);
+    else if (pub.payload_string() == "off") controller_heater_state_set(false);
+  }
+  else if (pub.topic() == MQTT_TOPIC"/bubble") {
+    if (pub.payload_string() == "on") controller_bubble_state_set(true);
+    else if (pub.payload_string() == "off") controller_bubble_state_set(false);
+  } 
+  else if (pub.topic() == MQTT_TOPIC"/target_temp") {
+    int new_temp = atoi((char *)pub.payload());
+    if ((validTempValue(new_temp)) && (new_temp != targetTemp)) {
+      controller_target_temperature_set(new_temp);
+    }  
+  }
+  else {
+    if (pub.payload_string() == "reset") {
+      requestRestart = true;
+    }
+  }
 }
 
 //******************************************************************************************
@@ -695,54 +838,113 @@ void setup() {
   Serial.setRxBufferSize(32);
   Serial.setDebugOutput(false);
 
-  Serial.println("start setup");
+  Serial.println('start setup');
   generateHostname();
-  WiFi.mode(WIFI_STA);
-  WiFi.persistent(false);
-  WiFi.disconnect(false);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(ssid, password);
 
-  int dotCount=0;
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
-    delay(250);
-    dotCount++;
-    if (dotCount >4*60) {
-        Serial.println("!");
-        ESP.reset();
-    }
+  // Initalise the WiFi Connection
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  WiFi.hostname(hostname);
+ 
+  Serial.println(VERSION);
+  Serial.print("\nUnit ID: ");
+  Serial.print("esp8266-");
+  Serial.print(ESP.getChipId(), HEX);
+  Serial.print("\nConnecting to "); Serial.print(ssid); Serial.print(" Wifi"); 
+  
+  while ((WiFi.status() != WL_CONNECTED) && kRetries --) {
+    delay(500);
+    Serial.print(" .");
   }
   
-  Serial.println("");
-  Serial.println("Intex Spa WiFi Controller");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-  Serial.print("Hostname: ");
-  Serial.println(hostname);
+  if (WiFi.status() == WL_CONNECTED) {  
+    Serial.println(" DONE");
+    Serial.print("IP Address is: "); Serial.println(WiFi.localIP());
+    Serial.print("Hostname is: "); Serial.println(hostname);
+    Serial.print("Connecting to "); Serial.print(MQTT_SERVER); Serial.print(" Broker . .");
+    delay(500);
+    
+    while (!mqttClient.connect(MQTT::Connect(MQTT_CLIENT).set_keepalive(90).set_auth(MQTT_USER, MQTT_PASS)) && kRetries --) {
+      Serial.print(" .");
+      delay(1000);
+    }
+    
+    if(mqttClient.connected()) {
+      Serial.println(" DONE");
+      Serial.println("\n----------------------------  Logs  ----------------------------");
+      Serial.println();
+      
+      mqttClient.subscribe(MQTT_TOPIC"/#");
+      mqttClient.set_callback(callback);
 
-  buzzSignal(1); //connected
-
-  WiFi.hostname(hostname);
-  
-  ota_setup();
-  
-  server_setup();
-  
-  homekit_setup();
-
-  buzzSignal(1); // homekit setup
-
-  SPI_begin();
+      buzzSignal(1); //connected
+      ota_setup();
+      server_setup();
+      initial_publish();
+      SPI_begin();
+   }
+   else {
+      Serial.println(" FAILED!");
+      Serial.println("\n----------------------------------------------------------------");
+      Serial.println();
+    }
+  }
+  else {
+    Serial.println(" WiFi FAILED!");
+    Serial.println("\n----------------------------------------------------------------");
+    Serial.println();
+  }
 }
 
 void loop() {
   ArduinoOTA.handle();
-  yield();
-  arduino_homekit_loop();
-  yield();
-  server.handleClient();
-  yield();
-  controller_loop();
-  yield();
+  if (OTAupdate == false) { 
+    mqttClient.loop();
+    yield();
+    timedTasks();
+    yield();
+    server.handleClient();
+    yield();
+    controller_loop();
+    yield();
+    if (requestRestart) {
+      ESP.restart();
+    }
+  }
+}
+
+void checkConnection() {
+  if (WiFi.status() == WL_CONNECTED)  {
+    if (mqttClient.connected()) {
+      mqttLog("mqtt broker connection . . . . . . . . . . OK");
+    } 
+    else {
+      Serial.println("mqtt broker connection . . . . . . . . . . LOST");
+      requestRestart = true;
+    }
+  }
+  else { 
+    Serial.println("WiFi connection . . . . . . . . . . LOST");
+    requestRestart = true;
+  }
+}
+
+void timedTasks() {
+  if ((millis() > TTasks + (kUpdFreq*60000)) || (millis() < TTasks)) { 
+    TTasks = millis();
+    checkConnection();
+  }
+}
+
+void mqttLog(String text) {
+  Serial.println(text);
+  if (mqttClient.connected()) {
+    mqttClient.publish(MQTT::Publish(MQTT_TOPIC"/log", text).set_retain().set_qos(1));
+  }
+}
+
+void mqttPublish(String topic, String text) {
+  if (mqttClient.connected()) {
+    mqttClient.publish(MQTT::Publish(MQTT_TOPIC"/" + topic, text).set_retain().set_qos(1));
+  }
 }
