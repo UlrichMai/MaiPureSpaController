@@ -5,7 +5,7 @@ This solution will allow you to control your Intex PureSpa<sup>tm</sup> SSP-H_20
 
 
 ## History
-  Entirely based on the work of @UlrichMai. The hardware design was great, and was just what I was looking for (no big relay switches needed). The code was a great starting point, with all the SPI codes already decoded. Using this I set about removing the HomeKit support, as I inented to intergate it with [Home Assistant](https://www.home-assistant.io). 
+  Entirely based on the work of [@UlrichMai](https://github.com/UlrichMai/MaiPureSpaController). The hardware design was great, and was just what I was looking for (no big relay switches needed). The code was a great starting point, with all the SPI codes already decoded. Using this I set about removing the HomeKit support, as I inented to intergate it with [Home Assistant](https://www.home-assistant.io). 
 
   MQTT is the best and easiest way to integrate custom ESP builds, so thats what I did. 
 
@@ -109,11 +109,7 @@ One of the wires I connected to the display controller board gave me control ove
 
 
 ## Known problems
-- It is not very stable, meaning it reboots several times a day. I have not figured out why. Please let me know if you found something that makes it more stable for you.
-- Sometimes it is not connecting to the wifi after such a reboot and you need to turn the power off/on.
 - After a reboot, it has lost the target temperature. I planned to persist the value, to restore it after a reboot.
-- Sometimes the call of the ISR is delayed and clock pulses are missed with gives wrong LED status. You can notice this when the HomeKit controls flicker.
-- It might need several retries to pair with HomeKit. Double check the your ESP is running at 160MHz.
 - You need to switch the power on before heater or pump control will have any effect on the unit. There is room for improvement in the future.
 
 ## Alternative solution, future developments
