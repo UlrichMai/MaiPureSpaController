@@ -5,11 +5,11 @@ This solution will allow you to control your Intex PureSpa<sup>tm</sup> SSP-H_20
 
 
 ## History
-  Entirely based on the work of [@UlrichMai](https://github.com/UlrichMai/MaiPureSpaController). The hardware design was great, and was just what I was looking for (no big relay switches needed). The code was a great starting point, with all the SPI codes already decoded. Using this I set about removing the HomeKit support, as I inented to intergate it with [Home Assistant](https://www.home-assistant.io). 
+  Entirely based on the work of [@UlrichMai](https://github.com/UlrichMai/MaiPureSpaController). The hardware design was great, and was just what I was looking for (no big relay switches needed). The code was a great starting point, with all the SPI codes already decoded. Using this I set about removing the HomeKit support, as I indented to integrate it with [Home Assistant](https://www.home-assistant.io). 
 
-  MQTT is the best and easiest way to integrate custom ESP builds, so thats what I did. 
+  MQTT is the best and easiest way to integrate custom ESP builds, so that's what I did. 
 
-  I've spent quie a bit of time testing and stablising the code, so that I can confidently leave it running and not get any restarts. 
+  I've spent quite a bit of time testing and stabilising the code, so that I can confidently leave it running and not get any restarts. 
 
 ## Hardware
 ### Schematic
