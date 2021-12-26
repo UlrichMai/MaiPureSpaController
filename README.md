@@ -1,22 +1,15 @@
-# MaiPureSpaController
-Update: please also see my implementaion in this branche https://github.com/UlrichMai/diyscip/tree/support-homekit .
-That project initially focused on MQTT and a hardware solution. I contributed support for my simple hardware, added HomeKit support, and support for the salt water pool type. That solution is very stable!
-Unfortunately my contribution was not accepted, but you can simply use/download my above branch.
+# MaiPureSpaController 
 
 ## IoT Controller for Intex PureSPA<sup>tm</sup>
-This solution will allow you to control your Intex PureSpa<sup>tm</sup> SSP-H_20-1C from your iPhone/iPad/Watch using HomeKit. I tried to keep the hardware to a minimum, no extra PCB needed, but you need to open the display and do some soldering, which will void your warranty. 
+This solution will allow you to control your Intex PureSpa<sup>tm</sup> SSP-H_20-1C from your iPhone/iPad/Watch using a Web Interface & MQTT (with optional Home Assistance integration). 
 
-It is still kind of unstable, but it is work in progress, suggestions to improve stability are welcome.
 
 ## History
-  This is my first Arduino project, and I like to apologize for my coding style, C++ is not my native programming language.
-  I played with Arduino and ESP8266 NodeMCU1.0, but had no interesting useful project, until I bought an whirlpool in summer 2019. I wanted to remote control my Intex PureSpa(tm) SSP-H_20-1C! I opened the control panel, saw the 74HC595 and had an idea how this may work. I decoded the signal bits by looking at the PCB. I bought a cheep 10€ logic analyzer that helped a lot (link at the end). I used my Arduino mini to simulate the signal, so I don't have to sit around the pool while testing my solutions. First I tried to use the existing ESP 8266 SPI interface in slave mode to receive the signals, with no luck. The SPI slave driver has to much protocol logic built in that is not needed. So the project rested over the winter.
-  
-  Thanks to [tinwhisker/IntexSpaRemote](https://github.com/tinwhisker/IntexSpaRemote) I restarted my project this year 2020. I followed the interrupt driven approach and it worked! I also solved the problem to simulate the button push.
-  
-  Because I had no existing home automation infrastructure yet, I thought it would be nice to integrate with Apple HomeKit and found [Mixiaoxiao/Arduino-HomeKit-ESP8266](https://github.com/Mixiaoxiao/Arduino-HomeKit-ESP8266) project with several nice examples. After some nights, I had a working accessory definition for the pool.
+  Entirely based on the work of [@UlrichMai](https://github.com/UlrichMai/MaiPureSpaController). The hardware design was great, and was just what I was looking for (no big relay switches needed). The code was a great starting point, with all the SPI codes already decoded. Using this I set about removing the HomeKit support, as I indented to integrate it with [Home Assistant](https://www.home-assistant.io). 
 
-  Finally I did throw the SPI decoder, the HomeKit integration, OTA and a web server page together and it somehow worked, just in-time for the pool season, that started May 1st. 
+  MQTT is the best and easiest way to integrate custom ESP builds, so that's what I did. 
+
+  I've spent quite a bit of time testing and stabilising the code, so that I can confidently leave it running and not get any restarts. 
 
 ## Hardware
 ### Schematic
@@ -104,9 +97,9 @@ The firmware offers an web interface, that you can check in first place, before 
 
 ![Web UI](docs/web_ui.png)
 
-### HomeKit Setup
-Please see the screen shots in docs folder (`homekit_setup_*.png`) for the pairing procedure
-![HomeKit Screen](docs/homekit_screen.png)
+### Home Assistant Integration
+![Hass UI](docs/hass-screenshot.png)
+
 
 ## Buzzer Beeps
 One of the wires I connected to the display controller board gave me control over the buzzer. First and main idea was to shut off the annoying beeps. But I also use it for signaling. You will hear 3 beeps during startup:
@@ -116,11 +109,7 @@ One of the wires I connected to the display controller board gave me control ove
 
 
 ## Known problems
-- It is not very stable, meaning it reboots several times a day. I have not figured out why. Please let me know if you found something that makes it more stable for you.
-- Sometimes it is not connecting to the wifi after such a reboot and you need to turn the power off/on.
 - After a reboot, it has lost the target temperature. I planned to persist the value, to restore it after a reboot.
-- Sometimes the call of the ISR is delayed and clock pulses are missed with gives wrong LED status. You can notice this when the HomeKit controls flicker.
-- It might need several retries to pair with HomeKit. Double check the your ESP is running at 160MHz.
 - You need to switch the power on before heater or pump control will have any effect on the unit. There is room for improvement in the future.
 
 ## Alternative solution, future developments
